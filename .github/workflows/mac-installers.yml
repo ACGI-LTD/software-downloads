@@ -1,0 +1,192 @@
+name: Build and test Mac installers
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Replace the four Mac installers on the downloads release after all tests pass
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  installers:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+            dmg: ACGI-360-Mac-Apple-Silicon.dmg
+            suffix: Apple-Silicon
+            sha256: 5a516ebd0faa60b74419c9484610cdbd9c90844ecf54e6142c0e3a5aafeb7b79
+          - arch: x86_64
+            runner: macos-15-intel
+            dmg: ACGI-360-Mac-Intel.dmg
+            suffix: Intel
+            sha256: 379d7a2b66ce843146d0ae2a20605c25db6ccc047858f4e242e835dc7a84220d
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      ACGI_APP: build/ACGI 360.app
+      ACGI_DMG: dist/ACGI-360-Mac-${{ matrix.suffix }}.dmg
+      ACGI_PKG: dist/ACGI-360-Mac-${{ matrix.suffix }}.pkg
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Download and verify the published Mac disk image
+        env:
+          ACGI_SOURCE_DMG: ${{ matrix.dmg }}
+          ACGI_SHA256: ${{ matrix.sha256 }}
+          ACGI_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          mkdir -p input build dist source-mounted
+          curl --fail --location --retry 3 --output "input/$ACGI_SOURCE_DMG" \
+            "https://github.com/$GITHUB_REPOSITORY/releases/download/downloads/$ACGI_SOURCE_DMG"
+          printf '%s  %s\n' "$ACGI_SHA256" "input/$ACGI_SOURCE_DMG" | shasum -a 256 -c -
+          hdiutil verify "input/$ACGI_SOURCE_DMG"
+          hdiutil attach -nobrowse -readonly -mountpoint "$PWD/source-mounted" "input/$ACGI_SOURCE_DMG"
+          trap 'hdiutil detach "$PWD/source-mounted" || true' EXIT
+          test "$(readlink source-mounted/Applications)" = /Applications
+          ditto 'source-mounted/ACGI 360.app' "$ACGI_APP"
+          hdiutil detach "$PWD/source-mounted"
+          trap - EXIT
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path('build/ACGI 360.app')
+          links = [item for item in root.rglob('*') if item.is_symlink()]
+          broken = [str(item) for item in links if not item.exists()]
+          if broken:
+              raise SystemExit('Broken framework symlinks: ' + ', '.join(broken))
+          print(f'Validated {len(links)} macOS framework symlinks')
+          PY
+          test -x "$ACGI_APP/Contents/MacOS/ACGI 360"
+          test "$(lipo -archs "$ACGI_APP/Contents/MacOS/ACGI 360")" = "$ACGI_ARCH"
+          test "$(plutil -extract CFBundleIdentifier raw -o - "$ACGI_APP/Contents/Info.plist")" = 'com.acgi.viewer360'
+          test "$(plutil -extract CFBundleShortVersionString raw -o - "$ACGI_APP/Contents/Info.plist")" = '1.1.1'
+          test "$(find "$ACGI_APP" -type l | wc -l | tr -d ' ')" -gt 0
+          codesign --verify --deep --strict --verbose=2 "$ACGI_APP"
+
+      - name: Install smoke-test dependency
+        env:
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
+        run: npm install --no-save --no-package-lock playwright@1.58.2
+
+      - name: Smoke-test the packaged Mac app
+        env:
+          ACGI_APP_EXECUTABLE: ${{ github.workspace }}/build/ACGI 360.app/Contents/MacOS/ACGI 360
+          DEBUG: pw:browser*
+        run: node tests/mac-installer-smoke.cjs
+
+      - name: Verify and smoke-test drag-to-Applications DMG
+        env:
+          ACGI_SOURCE_DMG: ${{ matrix.dmg }}
+          ACGI_SHA256: ${{ matrix.sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p mounted
+          cp "input/$ACGI_SOURCE_DMG" "$ACGI_DMG"
+          printf '%s  %s\n' "$ACGI_SHA256" "$ACGI_DMG" | shasum -a 256 -c -
+          hdiutil verify "$ACGI_DMG"
+          hdiutil attach -nobrowse -readonly -mountpoint "$PWD/mounted" "$ACGI_DMG"
+          trap 'hdiutil detach "$PWD/mounted" || true' EXIT
+          test -x 'mounted/ACGI 360.app/Contents/MacOS/ACGI 360'
+          test "$(readlink mounted/Applications)" = /Applications
+          ACGI_APP_EXECUTABLE="$PWD/mounted/ACGI 360.app/Contents/MacOS/ACGI 360" node tests/mac-installer-smoke.cjs
+          hdiutil detach "$PWD/mounted"
+          trap - EXIT
+
+      - name: Build and test Installer PKG
+        run: |
+          set -euo pipefail
+          # A direct productbuild --component package relocates to the copy in
+          # this CI workspace instead of installing into /Applications.
+          mkdir -p pkg-root/Applications
+          ditto "$ACGI_APP" 'pkg-root/Applications/ACGI 360.app'
+          pkgbuild --analyze --root pkg-root "$RUNNER_TEMP/acgi-components.plist"
+          python3 - "$RUNNER_TEMP/acgi-components.plist" <<'PY'
+          import plistlib
+          import sys
+          path = sys.argv[1]
+          with open(path, 'rb') as file:
+              components = plistlib.load(file)
+          for component in components:
+              component['BundleIsRelocatable'] = False
+          with open(path, 'wb') as file:
+              plistlib.dump(components, file)
+          print(f'Disabled relocation for {len(components)} package bundles')
+          PY
+          pkgbuild --root pkg-root --install-location / --component-plist "$RUNNER_TEMP/acgi-components.plist" --identifier com.acgi.viewer360.installer --version 1.1.1 "$RUNNER_TEMP/ACGI-360.component.pkg"
+          productbuild --package "$RUNNER_TEMP/ACGI-360.component.pkg" "$ACGI_PKG"
+          pkgutil --expand "$ACGI_PKG" "$RUNNER_TEMP/acgi-expanded-pkg"
+          sudo installer -pkg "$ACGI_PKG" -target /
+          pkgutil --pkg-info com.acgi.viewer360.installer
+          test -x '/Applications/ACGI 360.app/Contents/MacOS/ACGI 360'
+          ACGI_APP_EXECUTABLE='/Applications/ACGI 360.app/Contents/MacOS/ACGI 360' node tests/mac-installer-smoke.cjs
+
+      - name: Upload installer artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acgi-360-mac-${{ matrix.arch }}-installers
+          path: |
+            dist/ACGI-360-Mac-*.dmg
+            dist/ACGI-360-Mac-*.pkg
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: installers
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: acgi-360-mac-*-installers
+          path: dist
+          merge-multiple: true
+
+      - name: Upload only verified Mac installers to the downloads release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          files=(
+            dist/ACGI-360-Mac-Apple-Silicon.dmg
+            dist/ACGI-360-Mac-Apple-Silicon.pkg
+            dist/ACGI-360-Mac-Intel.dmg
+            dist/ACGI-360-Mac-Intel.pkg
+          )
+          for file in "${files[@]}"; do test -s "$file"; done
+          release_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/downloads" --jq .id)
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" > "$RUNNER_TEMP/assets-before.json"
+          windows_before=$(jq -r '.[] | select(.name == "ACGI-360-Windows.zip") | .digest' "$RUNNER_TEMP/assets-before.json")
+          test -n "$windows_before"
+          for file in "${files[@]}"; do
+            name=$(basename "$file")
+            gh release upload downloads "$file" --repo "$GITHUB_REPOSITORY" --clobber
+            echo "Replaced $name"
+          done
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" > "$RUNNER_TEMP/assets-after.json"
+          windows_after=$(jq -r '.[] | select(.name == "ACGI-360-Windows.zip") | .digest' "$RUNNER_TEMP/assets-after.json")
+          test "$windows_before" = "$windows_after"
+          for file in "${files[@]}"; do
+            name=$(basename "$file")
+            expected_size=$(stat -c %s "$file")
+            expected_digest="sha256:$(sha256sum "$file" | cut -d ' ' -f 1)"
+            actual_size=$(jq -r --arg name "$name" '.[] | select(.name == $name) | .size' "$RUNNER_TEMP/assets-after.json")
+            actual_digest=$(jq -r --arg name "$name" '.[] | select(.name == $name) | .digest' "$RUNNER_TEMP/assets-after.json")
+            test "$actual_size" = "$expected_size"
+            test "$actual_digest" = "$expected_digest"
+            echo "$name: $actual_size bytes, $actual_digest"
+          done
