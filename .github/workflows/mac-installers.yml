@@ -146,3 +146,60 @@ jobs:
             dist/ACGI-360-Mac-*.pkg
           if-no-files-found: error
           compression-level: 0
+
+  publish:
+    needs: installers
+    if: github.ref == 'refs/heads/codex/mac-installers'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: acgi-360-mac-*-installers
+          path: dist
+          merge-multiple: true
+
+      - name: Upload only verified Mac installers to the downloads release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          files=(
+            dist/ACGI-360-Mac-Apple-Silicon.dmg
+            dist/ACGI-360-Mac-Apple-Silicon.pkg
+            dist/ACGI-360-Mac-Intel.dmg
+            dist/ACGI-360-Mac-Intel.pkg
+          )
+          for file in "${files[@]}"; do test -s "$file"; done
+          gh release view downloads --repo "$GITHUB_REPOSITORY" --json assets > "$RUNNER_TEMP/assets-before.json"
+          windows_before=$(jq -r '.assets[] | select(.name == "ACGI-360-Windows.zip") | .digest' "$RUNNER_TEMP/assets-before.json")
+          test -n "$windows_before"
+          for file in "${files[@]}"; do
+            name=$(basename "$file")
+            expected_size=$(stat -c %s "$file")
+            expected_digest="sha256:$(sha256sum "$file" | cut -d ' ' -f 1)"
+            existing_size=$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .size' "$RUNNER_TEMP/assets-before.json")
+            existing_digest=$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .digest' "$RUNNER_TEMP/assets-before.json")
+            if [[ -n "$existing_size" ]]; then
+              test "$existing_size" = "$expected_size"
+              test "$existing_digest" = "$expected_digest"
+              echo "$name already uploaded with matching size and SHA-256"
+            else
+              gh release upload downloads "$file" --repo "$GITHUB_REPOSITORY"
+              echo "Uploaded $name"
+            fi
+          done
+          gh release view downloads --repo "$GITHUB_REPOSITORY" --json assets > "$RUNNER_TEMP/assets-after.json"
+          windows_after=$(jq -r '.assets[] | select(.name == "ACGI-360-Windows.zip") | .digest' "$RUNNER_TEMP/assets-after.json")
+          test "$windows_before" = "$windows_after"
+          for file in "${files[@]}"; do
+            name=$(basename "$file")
+            expected_size=$(stat -c %s "$file")
+            expected_digest="sha256:$(sha256sum "$file" | cut -d ' ' -f 1)"
+            actual_size=$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .size' "$RUNNER_TEMP/assets-after.json")
+            actual_digest=$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .digest' "$RUNNER_TEMP/assets-after.json")
+            test "$actual_size" = "$expected_size"
+            test "$actual_digest" = "$expected_digest"
+            echo "$name: $actual_size bytes, $actual_digest"
+          done
