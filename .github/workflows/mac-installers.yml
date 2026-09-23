@@ -54,6 +54,22 @@ jobs:
           gh release download downloads --repo "$GITHUB_REPOSITORY" --pattern "$ACGI_ZIP" --dir input
           printf '%s  %s\n' "$ACGI_SHA256" "input/$ACGI_ZIP" | shasum -a 256 -c -
           ditto -x -k "input/$ACGI_ZIP" build
+          # The cross-packed ZIP stored Windows separators in framework symlink targets.
+          # Repair them on macOS before code signing or launching the bundle.
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path('build/ACGI 360.app')
+          links = [item for item in root.rglob('*') if item.is_symlink()]
+          for item in links:
+              target = item.readlink().as_posix()
+              if '\\' in target:
+                  item.unlink()
+                  item.symlink_to(target.replace('\\', '/'))
+          broken = [str(item) for item in links if not item.exists()]
+          if broken:
+              raise SystemExit('Broken framework symlinks: ' + ', '.join(broken))
+          print(f'Validated {len(links)} macOS framework symlinks')
+          PY
           test -x "$ACGI_APP/Contents/MacOS/ACGI 360"
           test "$(lipo -archs "$ACGI_APP/Contents/MacOS/ACGI 360")" = "$ACGI_ARCH"
           test "$(plutil -extract CFBundleIdentifier raw -o - "$ACGI_APP/Contents/Info.plist")" = 'com.acgi.viewer360'

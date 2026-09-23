@@ -11,9 +11,8 @@ import('@electron/osx-sign').then(({sign}) => sign({
   app,
   identity: '-',
   identityValidation: false,
-  hardenedRuntime: false,
-  timestamp: 'none',
   preAutoEntitlements: false,
+  optionsForFile: () => ({hardenedRuntime: false, timestamp: 'none'}),
 })).then(() => {
   console.log('Applied macOS ad-hoc code signature.');
 }).catch(error => {
