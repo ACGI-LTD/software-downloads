@@ -1,9 +1,6 @@
 name: Build and test Mac installers
 
 on:
-  push:
-    branches:
-      - codex/mac-installers
   workflow_dispatch:
     inputs:
       publish:

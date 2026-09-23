@@ -16,6 +16,6 @@ ACGI 360 is a panorama viewer with self-contained HTML export. On Windows, extra
 
 The **downloads** release holds current public builds. Each product has a distinct asset name so website download links remain the same when builds are updated. Product assets are in the assets folder.
 
-The [Mac installer workflow](.github/workflows/mac-installers.yml) runs only when started manually. It checks the pinned SHA-256 hashes of the published DMGs, tests the apps on native Apple Silicon and Intel runners, preserves and smoke-tests the DMGs, builds and tests PKG installers, and saves both formats as workflow artifacts. Its **publish** option defaults to off; turning it on replaces only the four Mac installer assets after both architectures pass. Update the pinned DMG hashes when the source downloads change.
+The [Mac installer workflow](.github/workflows/mac-installers.yml) runs only when started manually. It checks the pinned SHA-256 hashes of the published DMGs, tests the apps on native Apple Silicon and Intel runners, preserves and smoke-tests the DMGs, builds and tests PKG installers, and saves both formats as workflow artifacts. Its **publish** option defaults to off; turning it on replaces only the four Mac installer assets after both architectures pass. For a new app release, update the pinned DMG hashes and the expected app and PKG versions in the workflow.
 
 This repository distributes compiled applications and product assets. No open-source license is granted by making these downloads available.
