@@ -109,16 +109,19 @@ jobs:
           trap - EXIT
 
       - name: Build and test Installer PKG
-        continue-on-error: true
         run: |
           set -euo pipefail
           productbuild --component "$ACGI_APP" /Applications "$ACGI_PKG"
           pkgutil --expand "$ACGI_PKG" "$RUNNER_TEMP/acgi-expanded-pkg"
           sudo installer -pkg "$ACGI_PKG" -target /
+          find /Applications -maxdepth 5 -iname '*acgi*' -print
+          pkgutil --pkgs | grep -i acgi || true
+          ls -ld '/Applications/ACGI 360.app' '/Applications/ACGI 360.app/Contents/MacOS/ACGI 360' || true
           test -x '/Applications/ACGI 360.app/Contents/MacOS/ACGI 360'
           ACGI_APP_EXECUTABLE='/Applications/ACGI 360.app/Contents/MacOS/ACGI 360' node tests/mac-installer-smoke.cjs
 
       - name: Upload installer artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: acgi-360-mac-${{ matrix.arch }}-installers
