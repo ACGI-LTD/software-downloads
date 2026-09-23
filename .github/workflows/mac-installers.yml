@@ -46,14 +46,14 @@ jobs:
 
       - name: Download and verify the published Mac disk image
         env:
-          GH_TOKEN: ${{ github.token }}
           ACGI_SOURCE_DMG: ${{ matrix.dmg }}
           ACGI_SHA256: ${{ matrix.sha256 }}
           ACGI_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           mkdir -p input build dist source-mounted
-          gh release download downloads --repo "$GITHUB_REPOSITORY" --pattern "$ACGI_SOURCE_DMG" --dir input
+          curl --fail --location --retry 3 --output "input/$ACGI_SOURCE_DMG" \
+            "https://github.com/$GITHUB_REPOSITORY/releases/download/downloads/$ACGI_SOURCE_DMG"
           printf '%s  %s\n' "$ACGI_SHA256" "input/$ACGI_SOURCE_DMG" | shasum -a 256 -c -
           hdiutil verify "input/$ACGI_SOURCE_DMG"
           hdiutil attach -nobrowse -readonly -mountpoint "$PWD/source-mounted" "input/$ACGI_SOURCE_DMG"
@@ -89,13 +89,15 @@ jobs:
           DEBUG: pw:browser*
         run: node tests/mac-installer-smoke.cjs
 
-      - name: Build and test drag-to-Applications DMG
+      - name: Verify and smoke-test drag-to-Applications DMG
+        env:
+          ACGI_SOURCE_DMG: ${{ matrix.dmg }}
+          ACGI_SHA256: ${{ matrix.sha256 }}
         run: |
           set -euo pipefail
-          mkdir -p dmg-root mounted
-          ditto "$ACGI_APP" 'dmg-root/ACGI 360.app'
-          ln -s /Applications dmg-root/Applications
-          hdiutil create -ov -volname 'ACGI 360' -srcfolder dmg-root -format UDZO "$ACGI_DMG"
+          mkdir -p mounted
+          cp "input/$ACGI_SOURCE_DMG" "$ACGI_DMG"
+          printf '%s  %s\n' "$ACGI_SHA256" "$ACGI_DMG" | shasum -a 256 -c -
           hdiutil verify "$ACGI_DMG"
           hdiutil attach -nobrowse -readonly -mountpoint "$PWD/mounted" "$ACGI_DMG"
           trap 'hdiutil detach "$PWD/mounted" || true' EXIT
