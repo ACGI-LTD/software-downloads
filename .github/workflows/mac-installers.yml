@@ -111,12 +111,28 @@ jobs:
       - name: Build and test Installer PKG
         run: |
           set -euo pipefail
-          productbuild --component "$ACGI_APP" /Applications "$ACGI_PKG"
+          # A direct productbuild --component package relocates to the copy in
+          # this CI workspace instead of installing into /Applications.
+          mkdir -p pkg-root/Applications
+          ditto "$ACGI_APP" 'pkg-root/Applications/ACGI 360.app'
+          pkgbuild --analyze --root pkg-root "$RUNNER_TEMP/acgi-components.plist"
+          python3 - "$RUNNER_TEMP/acgi-components.plist" <<'PY'
+          import plistlib
+          import sys
+          path = sys.argv[1]
+          with open(path, 'rb') as file:
+              components = plistlib.load(file)
+          for component in components:
+              component['BundleIsRelocatable'] = False
+          with open(path, 'wb') as file:
+              plistlib.dump(components, file)
+          print(f'Disabled relocation for {len(components)} package bundles')
+          PY
+          pkgbuild --root pkg-root --install-location / --component-plist "$RUNNER_TEMP/acgi-components.plist" --identifier com.acgi.viewer360.installer --version 1.1.1 "$RUNNER_TEMP/ACGI-360.component.pkg"
+          productbuild --package "$RUNNER_TEMP/ACGI-360.component.pkg" "$ACGI_PKG"
           pkgutil --expand "$ACGI_PKG" "$RUNNER_TEMP/acgi-expanded-pkg"
           sudo installer -pkg "$ACGI_PKG" -target /
-          find /Applications -maxdepth 5 -iname '*acgi*' -print
-          pkgutil --pkgs | grep -i acgi || true
-          ls -ld '/Applications/ACGI 360.app' '/Applications/ACGI 360.app/Contents/MacOS/ACGI 360' || true
+          pkgutil --pkg-info com.acgi.viewer360.installer
           test -x '/Applications/ACGI 360.app/Contents/MacOS/ACGI 360'
           ACGI_APP_EXECUTABLE='/Applications/ACGI 360.app/Contents/MacOS/ACGI 360' node tests/mac-installer-smoke.cjs
 
