@@ -4,11 +4,13 @@ on:
   push:
     branches:
       - codex/mac-installers
-    paths:
-      - .github/workflows/mac-installers.yml
-      - tests/mac-installer-smoke.cjs
-      - tests/mac-adhoc-sign.cjs
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Replace the four Mac installers on the downloads release after all tests pass
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -21,14 +23,14 @@ jobs:
         include:
           - arch: arm64
             runner: macos-15
-            zip: ACGI-360-Mac-Apple-Silicon.zip
+            dmg: ACGI-360-Mac-Apple-Silicon.dmg
             suffix: Apple-Silicon
-            sha256: C212CB7382CD25ACA215F7F8FF6DCF8E758655D12C96B380D97F561745AB12D4
+            sha256: 5a516ebd0faa60b74419c9484610cdbd9c90844ecf54e6142c0e3a5aafeb7b79
           - arch: x86_64
             runner: macos-15-intel
-            zip: ACGI-360-Mac-Intel.zip
+            dmg: ACGI-360-Mac-Intel.dmg
             suffix: Intel
-            sha256: 80E8551A3B21C0D785F0CE128E88BEF2F51987F7355E1D0F273C9EC7FA238A6F
+            sha256: 379d7a2b66ce843146d0ae2a20605c25db6ccc047858f4e242e835dc7a84220d
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     env:
@@ -42,29 +44,28 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Download and verify the published app bundle
+      - name: Download and verify the published Mac disk image
         env:
           GH_TOKEN: ${{ github.token }}
-          ACGI_ZIP: ${{ matrix.zip }}
+          ACGI_SOURCE_DMG: ${{ matrix.dmg }}
           ACGI_SHA256: ${{ matrix.sha256 }}
           ACGI_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          mkdir -p input build dist
-          gh release download downloads --repo "$GITHUB_REPOSITORY" --pattern "$ACGI_ZIP" --dir input
-          printf '%s  %s\n' "$ACGI_SHA256" "input/$ACGI_ZIP" | shasum -a 256 -c -
-          ditto -x -k "input/$ACGI_ZIP" build
-          # The cross-packed ZIP stored Windows separators in framework symlink targets.
-          # Repair them on macOS before code signing or launching the bundle.
+          mkdir -p input build dist source-mounted
+          gh release download downloads --repo "$GITHUB_REPOSITORY" --pattern "$ACGI_SOURCE_DMG" --dir input
+          printf '%s  %s\n' "$ACGI_SHA256" "input/$ACGI_SOURCE_DMG" | shasum -a 256 -c -
+          hdiutil verify "input/$ACGI_SOURCE_DMG"
+          hdiutil attach -nobrowse -readonly -mountpoint "$PWD/source-mounted" "input/$ACGI_SOURCE_DMG"
+          trap 'hdiutil detach "$PWD/source-mounted" || true' EXIT
+          test "$(readlink source-mounted/Applications)" = /Applications
+          ditto 'source-mounted/ACGI 360.app' "$ACGI_APP"
+          hdiutil detach "$PWD/source-mounted"
+          trap - EXIT
           python3 - <<'PY'
           from pathlib import Path
           root = Path('build/ACGI 360.app')
           links = [item for item in root.rglob('*') if item.is_symlink()]
-          for item in links:
-              target = item.readlink().as_posix()
-              if '\\' in target:
-                  item.unlink()
-                  item.symlink_to(target.replace('\\', '/'))
           broken = [str(item) for item in links if not item.exists()]
           if broken:
               raise SystemExit('Broken framework symlinks: ' + ', '.join(broken))
@@ -75,16 +76,12 @@ jobs:
           test "$(plutil -extract CFBundleIdentifier raw -o - "$ACGI_APP/Contents/Info.plist")" = 'com.acgi.viewer360'
           test "$(plutil -extract CFBundleShortVersionString raw -o - "$ACGI_APP/Contents/Info.plist")" = '1.1.1'
           test "$(find "$ACGI_APP" -type l | wc -l | tr -d ' ')" -gt 0
+          codesign --verify --deep --strict --verbose=2 "$ACGI_APP"
 
       - name: Install smoke-test dependency
         env:
           PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: '1'
-        run: npm install --no-save --no-package-lock playwright@1.58.2 @electron/osx-sign@2.7.0
-
-      - name: Apply local ad-hoc signature for macOS execution
-        run: |
-          node tests/mac-adhoc-sign.cjs "$ACGI_APP"
-          codesign --verify --deep --strict --verbose=2 "$ACGI_APP"
+        run: npm install --no-save --no-package-lock playwright@1.58.2
 
       - name: Smoke-test the packaged Mac app
         env:
@@ -149,7 +146,7 @@ jobs:
 
   publish:
     needs: installers
-    if: github.ref == 'refs/heads/codex/mac-installers'
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -172,33 +169,24 @@ jobs:
             dist/ACGI-360-Mac-Intel.pkg
           )
           for file in "${files[@]}"; do test -s "$file"; done
-          gh release view downloads --repo "$GITHUB_REPOSITORY" --json assets > "$RUNNER_TEMP/assets-before.json"
-          windows_before=$(jq -r '.assets[] | select(.name == "ACGI-360-Windows.zip") | .digest' "$RUNNER_TEMP/assets-before.json")
+          release_id=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/downloads" --jq .id)
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" > "$RUNNER_TEMP/assets-before.json"
+          windows_before=$(jq -r '.[] | select(.name == "ACGI-360-Windows.zip") | .digest' "$RUNNER_TEMP/assets-before.json")
           test -n "$windows_before"
           for file in "${files[@]}"; do
             name=$(basename "$file")
-            expected_size=$(stat -c %s "$file")
-            expected_digest="sha256:$(sha256sum "$file" | cut -d ' ' -f 1)"
-            existing_size=$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .size' "$RUNNER_TEMP/assets-before.json")
-            existing_digest=$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .digest' "$RUNNER_TEMP/assets-before.json")
-            if [[ -n "$existing_size" ]]; then
-              test "$existing_size" = "$expected_size"
-              test "$existing_digest" = "$expected_digest"
-              echo "$name already uploaded with matching size and SHA-256"
-            else
-              gh release upload downloads "$file" --repo "$GITHUB_REPOSITORY"
-              echo "Uploaded $name"
-            fi
+            gh release upload downloads "$file" --repo "$GITHUB_REPOSITORY" --clobber
+            echo "Replaced $name"
           done
-          gh release view downloads --repo "$GITHUB_REPOSITORY" --json assets > "$RUNNER_TEMP/assets-after.json"
-          windows_after=$(jq -r '.assets[] | select(.name == "ACGI-360-Windows.zip") | .digest' "$RUNNER_TEMP/assets-after.json")
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id/assets?per_page=100" > "$RUNNER_TEMP/assets-after.json"
+          windows_after=$(jq -r '.[] | select(.name == "ACGI-360-Windows.zip") | .digest' "$RUNNER_TEMP/assets-after.json")
           test "$windows_before" = "$windows_after"
           for file in "${files[@]}"; do
             name=$(basename "$file")
             expected_size=$(stat -c %s "$file")
             expected_digest="sha256:$(sha256sum "$file" | cut -d ' ' -f 1)"
-            actual_size=$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .size' "$RUNNER_TEMP/assets-after.json")
-            actual_digest=$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .digest' "$RUNNER_TEMP/assets-after.json")
+            actual_size=$(jq -r --arg name "$name" '.[] | select(.name == $name) | .size' "$RUNNER_TEMP/assets-after.json")
+            actual_digest=$(jq -r --arg name "$name" '.[] | select(.name == $name) | .digest' "$RUNNER_TEMP/assets-after.json")
             test "$actual_size" = "$expected_size"
             test "$actual_digest" = "$expected_digest"
             echo "$name: $actual_size bytes, $actual_digest"
